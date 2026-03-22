@@ -231,6 +231,40 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	return 200, c.HandleResponse(resp.Body, stream, gc)
 }
 
+// SendMessageAnthropic sends a message and returns response in Anthropic Messages API format
+func (c *Client) SendMessageAnthropic(conversationID string, message string, stream bool, requestModel string, gc *gin.Context) (int, error) {
+	if c.orgID == "" {
+		return 500, errors.New("organization ID not set")
+	}
+	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
+		c.orgID, conversationID)
+	// Create request body with default attributes
+	requestBody := c.defaultAttrs
+	requestBody["prompt"] = message
+	if c.model != "claude-sonnet-4-20250514" && c.model != "claude-sonnet-4-6-20250514" {
+		requestBody["model"] = c.model
+	}
+	// Set up streaming response
+	resp, err := c.client.R().DisableAutoReadResponse().
+		SetHeader("referer", fmt.Sprintf("https://claude.ai/chat/%s", conversationID)).
+		SetHeader("accept", "text/event-stream, text/event-stream").
+		SetHeader("anthropic-client-platform", "web_claude_ai").
+		SetHeader("cache-control", "no-cache").
+		SetBody(requestBody).
+		Post(url)
+	if err != nil {
+		return 500, fmt.Errorf("request failed: %w", err)
+	}
+	logger.Info(fmt.Sprintf("Claude response status code: %d", resp.StatusCode))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return 200, c.HandleAnthropicResponse(resp.Body, stream, requestModel, gc)
+}
+
 // HandleResponse converts Claude's SSE format to OpenAI format and writes to the response writer
 func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context) error {
 	defer body.Close()
@@ -421,6 +455,258 @@ func decodeUnicodeEscape(s string) string {
 		}
 	}
 	return string(result)
+}
+
+// HandleAnthropicResponse converts Claude's SSE format to Anthropic Messages API format
+func (c *Client) HandleAnthropicResponse(body io.ReadCloser, stream bool, requestModel string, gc *gin.Context) error {
+	defer body.Close()
+
+	msgID := model.GenerateMsgID()
+
+	// Set headers for streaming
+	if stream {
+		gc.Writer.Header().Set("Content-Type", "text/event-stream")
+		gc.Writer.Header().Set("Cache-Control", "no-cache")
+		gc.Writer.Header().Set("Connection", "keep-alive")
+		gc.Writer.WriteHeader(http.StatusOK)
+		gc.Writer.Flush()
+
+		// Send message_start event
+		model.SendAnthropicStreamEvent("message_start", map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id":          msgID,
+				"type":        "message",
+				"role":        "assistant",
+				"content":     []interface{}{},
+				"model":       requestModel,
+				"stop_reason": nil,
+				"usage":       map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
+			},
+		}, gc)
+
+		// Send ping event
+		model.SendAnthropicStreamEvent("ping", map[string]interface{}{"type": "ping"}, gc)
+	}
+
+	scanner := bufio.NewScanner(body)
+	clientDone := gc.Request.Context().Done()
+
+	// Track response content
+	resAllText := ""
+	thinkingShown := false
+	partialJSONShown := false
+	useTool := false
+	useToolEnd := false
+	nextLanguage := false
+	languageStr := "md"
+	contentBlockStarted := false
+	blockIndex := 0
+
+	for scanner.Scan() {
+		select {
+		case <-clientDone:
+			logger.Info("Client closed connection")
+			return nil
+		default:
+		}
+
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := line[6:]
+		var event ResponseEvent
+		if err := json.Unmarshal([]byte(data), &event); err == nil {
+			// Handle errors
+			if event.Type == "error" && event.Error.Message != "" {
+				resAllText += event.Error.Message
+				if stream && !contentBlockStarted {
+					model.SendAnthropicStreamEvent("content_block_start", map[string]interface{}{
+						"type":          "content_block_start",
+						"index":         blockIndex,
+						"content_block": map[string]interface{}{"type": "text", "text": ""},
+					}, gc)
+					contentBlockStarted = true
+				}
+				if stream {
+					model.SendAnthropicStreamEvent("content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": blockIndex,
+						"delta": map[string]interface{}{"type": "text_delta", "text": event.Error.Message},
+					}, gc)
+				}
+				continue
+			}
+
+			if event.ContentBlock.Type == "tool_use" {
+				useTool = true
+			}
+			if event.ContentBlock.Type == "tool_result" {
+				useToolEnd = true
+			}
+
+			if event.Type == "content_block_stop" {
+				resText := ""
+				if thinkingShown {
+					resText = "</think>\n"
+					thinkingShown = false
+				}
+				if partialJSONShown {
+					resText = "\n```\n"
+					partialJSONShown = false
+				}
+				resAllText += resText
+				if stream && resText != "" {
+					model.SendAnthropicStreamEvent("content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": blockIndex,
+						"delta": map[string]interface{}{"type": "text_delta", "text": resText},
+					}, gc)
+				}
+				continue
+			}
+
+			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+				resText := event.Delta.Text
+				resAllText += resText
+				if stream {
+					if !contentBlockStarted {
+						model.SendAnthropicStreamEvent("content_block_start", map[string]interface{}{
+							"type":          "content_block_start",
+							"index":         blockIndex,
+							"content_block": map[string]interface{}{"type": "text", "text": ""},
+						}, gc)
+						contentBlockStarted = true
+					}
+					model.SendAnthropicStreamEvent("content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": blockIndex,
+						"delta": map[string]interface{}{"type": "text_delta", "text": resText},
+					}, gc)
+				}
+				continue
+			}
+
+			if event.Delta.Type == "thinking_delta" {
+				resText := event.Delta.THINKING
+				if !thinkingShown {
+					resText = "<think> " + resText
+					thinkingShown = true
+				}
+				resAllText += resText
+				if stream {
+					if !contentBlockStarted {
+						model.SendAnthropicStreamEvent("content_block_start", map[string]interface{}{
+							"type":          "content_block_start",
+							"index":         blockIndex,
+							"content_block": map[string]interface{}{"type": "text", "text": ""},
+						}, gc)
+						contentBlockStarted = true
+					}
+					model.SendAnthropicStreamEvent("content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": blockIndex,
+						"delta": map[string]interface{}{"type": "text_delta", "text": resText},
+					}, gc)
+				}
+				continue
+			}
+
+			if event.Delta.Type == "input_json_delta" {
+				resText := event.Delta.PartialJSON
+				if useTool && resText == ",\"content\":" {
+					useTool = false
+					partialJSONShown = false
+					continue
+				}
+				if resText == ",\"language\":" || resText == ",\"type\":" {
+					nextLanguage = true
+					continue
+				}
+				if nextLanguage {
+					languageStr = resText[1:]
+					if languageStr == "text/html" {
+						languageStr = "html"
+					}
+					nextLanguage = false
+				}
+				if useTool {
+					continue
+				}
+				if useToolEnd {
+					useToolEnd = false
+					continue
+				}
+				if strings.HasPrefix(resText, "\"") {
+					resText = resText[1:]
+				}
+				if resText == "\"}" || resText == "}" {
+					resText = ""
+				}
+				unquote, err := strconv.Unquote(fmt.Sprintf("\"%s\"", resText))
+				if err == nil {
+					resText = unquote
+				} else {
+					resText = strings.ReplaceAll(resText, "\\\\n", "")
+					resText = strings.ReplaceAll(resText, "\\\\u", "\\u")
+					resText = strings.ReplaceAll(resText, "\\\"", "\"")
+					resText = strings.ReplaceAll(resText, "\\\\'", "'")
+					resText = strings.ReplaceAll(resText, "\\n", "\n")
+					resText = strings.ReplaceAll(resText, "\\t", "\t")
+					resText = decodeUnicodeEscape(resText)
+				}
+				if !partialJSONShown {
+					resText = "\n```" + languageStr + "\n" + resText
+					partialJSONShown = true
+				}
+				resAllText += resText
+				if stream {
+					if !contentBlockStarted {
+						model.SendAnthropicStreamEvent("content_block_start", map[string]interface{}{
+							"type":          "content_block_start",
+							"index":         blockIndex,
+							"content_block": map[string]interface{}{"type": "text", "text": ""},
+						}, gc)
+						contentBlockStarted = true
+					}
+					model.SendAnthropicStreamEvent("content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": blockIndex,
+						"delta": map[string]interface{}{"type": "text_delta", "text": resText},
+					}, gc)
+				}
+				continue
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	if stream {
+		// Send content_block_stop
+		if contentBlockStarted {
+			model.SendAnthropicStreamEvent("content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": blockIndex,
+			}, gc)
+		}
+		// Send message_delta
+		model.SendAnthropicStreamEvent("message_delta", map[string]interface{}{
+			"type":  "message_delta",
+			"delta": map[string]interface{}{"stop_reason": "end_turn", "stop_sequence": nil},
+			"usage": map[string]interface{}{"output_tokens": 0},
+		}, gc)
+		// Send message_stop
+		model.SendAnthropicStreamEvent("message_stop", map[string]interface{}{"type": "message_stop"}, gc)
+	} else {
+		// Non-streaming response
+		model.ReturnAnthropicResponse(resAllText, requestModel, gc)
+	}
+
+	return nil
 }
 
 // DeleteConversation deletes a conversation by ID

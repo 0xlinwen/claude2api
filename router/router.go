@@ -20,6 +20,9 @@ func SetupRoutes(r *gin.Engine) {
 	r.POST("/v1/chat/completions", service.ChatCompletionsHandler)
 	r.GET("/v1/models", service.MoudlesHandler)
 
+	// Anthropic Messages API endpoint
+	r.POST("/v1/messages", service.AnthropicMessagesHandler)
+
 	if config.ConfigInstance.EnableMirrorApi {
 		r.POST(config.ConfigInstance.MirrorApiPrefix+"/v1/chat/completions", service.MirrorChatHandler)
 		r.GET(config.ConfigInstance.MirrorApiPrefix+"/v1/models", service.MoudlesHandler)
