@@ -195,6 +195,8 @@ func handleChatRequest(c *gin.Context, session config.SessionInfo, model string,
 	claudeClient := core.NewClient(session.SessionKey, config.ConfigInstance.Proxy, model)
 
 	// Get org ID if not already set
+	// If GetOrgID fails (e.g., 403 error), return false to trigger retry with another session
+	// instead of continuing with empty org ID which would cause CreateConversation to fail
 	if session.OrgID == "" {
 		orgId, err := claudeClient.GetOrgID()
 		if err != nil {
