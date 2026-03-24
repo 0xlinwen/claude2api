@@ -46,6 +46,8 @@ func parseSessionEnv(envValue string) (int, []SessionInfo) {
 		return 0, []SessionInfo{}
 	}
 	var sessions []SessionInfo
+	// 支持换行分隔的 key，每行一个更直观
+	envValue = strings.ReplaceAll(envValue, "\n", ",")
 	sessionPairs := strings.Split(envValue, ",")
 	retryCount := len(sessionPairs) // 重试次数等于 session 数量
 	for _, pair := range sessionPairs {
