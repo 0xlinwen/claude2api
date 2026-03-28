@@ -169,7 +169,7 @@ func (c *Client) CreateConversation() (string, error) {
 		"name":                             "",
 		"include_conversation_preferences": true,
 	}
-	if c.model == "claude-sonnet-4-20250514" || c.model == "claude-sonnet-4-6-20250514" {
+	if c.model == "claude-sonnet-4-20250514" || c.model == "claude-sonnet-4-6-20250514" || c.model == "claude-sonnet-4-6" {
 		// 删除model
 		delete(requestBody, "model")
 	}
@@ -207,7 +207,7 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	// Create request body with default attributes
 	requestBody := c.defaultAttrs
 	requestBody["prompt"] = message
-	if c.model != "claude-sonnet-4-20250514" && c.model != "claude-sonnet-4-6-20250514" {
+	if c.model != "claude-sonnet-4-20250514" && c.model != "claude-sonnet-4-6-20250514" && c.model != "claude-sonnet-4-6" {
 		requestBody["model"] = c.model
 	}
 	// Set up streaming response
@@ -241,7 +241,7 @@ func (c *Client) SendMessageAnthropic(conversationID string, message string, str
 	// Create request body with default attributes
 	requestBody := c.defaultAttrs
 	requestBody["prompt"] = message
-	if c.model != "claude-sonnet-4-20250514" && c.model != "claude-sonnet-4-6-20250514" {
+	if c.model != "claude-sonnet-4-20250514" && c.model != "claude-sonnet-4-6-20250514" && c.model != "claude-sonnet-4-6" {
 		requestBody["model"] = c.model
 	}
 	// Set up streaming response
